@@ -1,0 +1,223 @@
+#! /usr/bin/perl
+
+use strict;
+
+use open ':locale';
+
+use File::Basename;
+use IO::Handle;
+
+use AnyEvent;
+use AnyEvent::XMPP::Ext::Disco;
+use AnyEvent::XMPP::Ext::MUC;
+use AnyEvent::XMPP::Client;
+use AnyEvent::XMPP::Util qw(split_jid simxml);
+
+
+use Data::Dumper;
+$Data::Dumper::Sortkeys = $Data::Dumper::Indent = 1;
+
+
+my %sconf;
+if (open my $conf, "<", "/etc/zabbix/zabbix_server.conf") {
+    while (<$conf>) {
+	if (/^\s*(\W+)\s*=\s*(.*)/) {
+	    $sconf{lc $1} = $2;
+	}
+    }
+}
+
+my %conf = 
+  ( user => 'zabbix',
+    domain => 'DOMAIN',
+    password => 'PASSWORD',
+    resource => 'Zabbix',
+  );
+
+if (open my $conf, "<", "/etc/zabbix/zabbix_xmpp-bot.conf") {
+    while (<$conf>) {
+	if (/^\s*(\W+)\s*=\s*(.*)/) {
+	    $conf{lc $1} = $2;
+	}
+    }
+}
+
+my $base_name = dirname($sconf{pidfile})."/zabbix_xmpp-bot";
+my $pid_file  = $conf{pidfile} || "$basename.pid";
+my $ctl_sock  = $conf{controlsocket} || "$basename.sock";
+
+
+my $mode = shift;
+
+
+
+if ($mode eq 'start') {
+    bot_start;
+}
+elsif ($mode eq 'stop') {
+    bot_stop;
+}
+elsif ($mode eq 'restart') {
+    bot_stop;
+    bot_start;
+}
+elsif ($mode eq 'condrestart') {
+    if (bot_started) {
+	bot_stop;
+	bot_start;
+    }
+}
+elsif ($mode eq 'send') {
+    unless (bot_started) {
+	bot_start(1);
+    }
+    bot_send(@_);
+}
+
+exit;
+
+sub bot_started {
+    my $pid;
+    if (open my $pf, "<", $pidfile) {
+	$pid = <$pf>;
+	chomp $pid;	
+    }
+    return undef;
+}
+
+sub bot_running {
+    my $pid = bot_started;
+    if ($pid && kill 0, $pid) {
+	return $pid;
+    }
+    return undef;
+}
+
+sub bot_start {
+    my($quiet) = @_;
+
+    if (bot_running) {
+	printf STDERR "Zabbix XMPP bot already running\n" unless $quiet;
+	exit;
+    }
+
+    pipe my $rpipe, my $wpipe;
+    $rpipe->autoflush;
+    $wpipe->autoflush;
+    
+    my $pid = fork;
+
+    unless (defined $pid) {
+	die STDERR "Error forking: $!\n";
+    }
+
+    if ($pid) {
+	# Parent
+	open my $pf, ">", $pidfile
+	  or warn "unable to write to $pidfile: $!\n";
+	printf $pf "%d\n", $pid;
+	close $pf;
+
+	while (<$rpipe>) {
+	    if (/^OK/) {
+		exit;
+	    }
+	    printf STDERR "$msg";
+	}
+
+	exit;
+    }
+
+    close STDIN;
+    close STDERR;
+
+    printf $wpipe "Connecting...\n";
+
+    my $stop  = AnyEvent->condvar;
+    my $bot   = AnyEvent::XMPP::Client->new(debug => 0);
+    my $disco = AnyEvent::XMPP::Ext::Disco->new();
+    my $muc   = AnyEvent::XMPP::Ext::MUC->new(disco => $disco);
+    
+    $bot->add_extension ($disco);
+    $bot->add_extension ($muc);
+
+    $bot->set_presence(undef, 'Zabbix bot running', 1);
+
+    $bot->add_account("$conf{user}\@$conf{domain}/$conf{resource}", $conf{password});
+
+    $bot->reg_cb
+      (
+       session_ready => sub {
+	   my ($cl, $acc) = @_;
+	   print $wpipe "Session ready\n";
+	   $muc->join_room($acc->connection,
+			   'ROOM',
+			   'NICK');
+	   $muc->reg_cb(message => \&cb_muc_message,
+			join => \&cb_muc_join,
+		       );
+       },
+       message => \&cb_message,
+       contact_request_subscribe => \&cb_contact_request_subscribe,
+       contact_subscribed => \&cb_contact_subscribed,
+       error => sub {
+	   my ($cl, $acc, $error) = @_;
+	   warn "Error encountered: ".$error->string."\n";
+	   $bot->broadcast;
+       },
+       disconnect => sub {
+	   warn "Got disconnected: [@_]\n";
+	   $bot->broadcast;
+       },
+      );
+    
+    $bot->start;
+
+    printf $wpipe "OK\n";
+
+    $stop->wait;
+}
+
+our $AUTOLOAD;
+our %autoload;
+sub AUTOLOAD {
+    my $proc = $AUTOLOAD;
+    my $file = "auto::${proc}.pl";
+    $file =~ s,::,/,g;
+    my $sym  = $proc;
+    $sym =~ s/::/_/g;
+
+    if (-f $file) {
+	my $time = (stat $file)[9];
+	unless ($time == $autoload{$AUTOLOAD}{time}) {
+	    open my $func, "<", $file;
+	    my $def = do { local $/ = undef; <$func>; };
+	    close $file;
+	    my $pkg = sprintf "auto_%s_%d", $sym, time;
+	    eval "package $pkg; $def\n1;";
+	    if ($@) {
+		print "\e[31m***\e[m failed to load updated $file\n";
+		print "$@";
+	    }
+	    else {
+		no strict 'refs';
+		$autoload{$AUTOLOAD}{time} = $time;
+		undef $autoload{$AUTOLOAD}{def};
+		my $sub = $AUTOLOAD;
+		$sub =~ s/.*:://;
+		$autoload{$AUTOLOAD}{def} = ${$pkg.'::'}{$sub};
+		printf "\e[33m***\e[m Autoloaded: %s...\n", $sub;
+		%sth_cache = ();
+		for (qw(global sth)) {
+		    *{$pkg.'::'.$_} = \&{$_};
+		}
+	    }
+	}
+	if (exists $autoload{$AUTOLOAD}{def}) {
+	    &{$autoload{$AUTOLOAD}{def}};
+	}
+    }
+    else {
+	print "\e[31m***\e[m missing $file for load of $AUTOLOAD at ".join(":", (caller)[1,2])."\n";
+    }
+}
